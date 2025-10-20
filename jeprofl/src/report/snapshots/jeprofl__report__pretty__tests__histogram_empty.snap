@@ -1,0 +1,7 @@
+---
+source: jeprofl/src/report/pretty.rs
+expression: buf
+---
+≤UpperBound | Count     | Percentage | ##################################################
+----------+-----------+------------+--------------------------------------------------
+Total value: 0 across 0 events

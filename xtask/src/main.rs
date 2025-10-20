@@ -1,5 +1,5 @@
-mod build_ebpf;
 mod build;
+mod build_ebpf;
 mod run;
 
 use std::process::exit;

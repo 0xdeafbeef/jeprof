@@ -1,16 +1,29 @@
 #![no_std]
 
-pub const MIN_ALLOC_INDEX: u32 = 0;
-pub const MAX_ALLOC_INDEX: u32 = 1;
-pub const COUNT_INDEX: u32 = 2;
-pub const SAMPLE_EVERY_INDEX: u32 = 3;
-pub const FUNCTION_INFO_INDEX: u32 = 4;
+pub const CONFIG_SLOT: u32 = 0;
+pub const COUNTER_SLOT: u32 = 0;
 
-const MAX_TRACKED_ALLOCATION_SIZE: usize = const {
-    const GIB: usize = 1024 * 1024 * 1024;
-    const MAX: usize = 16 * GIB;
-    MAX.ilog2() as usize
-};
+pub const HISTOGRAM_BUCKETS: usize = 56;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricMode {
+    Count = 0,
+    DurationNs = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub mode: u32,
+    pub min_value: u64,
+    pub max_value: u64,
+    pub sample_every: u32,
+    pub _pad: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Config {}
 
 #[repr(C)]
 #[derive(Clone, Debug, Copy, Hash, PartialEq, Eq)]
@@ -66,7 +79,7 @@ unsafe impl aya::Pod for HistogramKey {}
 #[repr(C)]
 #[derive(Clone, Debug, Copy)]
 pub struct Histogram {
-    pub data: [u64; MAX_TRACKED_ALLOCATION_SIZE],
+    pub data: [u64; HISTOGRAM_BUCKETS],
     pub total: u64,
 }
 
@@ -77,7 +90,7 @@ impl Histogram {
     #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
-            data: [0; MAX_TRACKED_ALLOCATION_SIZE],
+            data: [0; HISTOGRAM_BUCKETS],
             total: 0,
         }
     }
@@ -87,11 +100,11 @@ impl Histogram {
             // log(0) is undefined
             return;
         }
-        let pow2 = value.ilog2() as usize;
-
-        if let Some(bucket) = self.data.get_mut(pow2) {
-            *bucket += 1;
+        let mut pow2 = value.ilog2() as usize;
+        if pow2 >= self.data.len() {
+            pow2 = self.data.len() - 1;
         }
+        self.data[pow2] = self.data[pow2].saturating_add(1);
         self.total = self.total.saturating_add(value);
     }
 

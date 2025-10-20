@@ -1,64 +1,72 @@
-use crate::collector::spawn_collector;
+use anyhow::ensure;
 use aya::maps::{PerCpuArray, PerCpuHashMap, PerCpuValues, StackTraceMap};
 use aya::programs::UProbe;
 use aya::util::nr_cpus;
 use aya::{include_bytes_aligned, Ebpf};
-
 use aya_log::EbpfLogger;
-use bytesize::ByteSize;
-use clap::Parser;
-use jeprofl_common::{
-    Histogram, HistogramKey, COUNT_INDEX, FUNCTION_INFO_INDEX, MAX_ALLOC_INDEX, MIN_ALLOC_INDEX,
-    SAMPLE_EVERY_INDEX,
-};
+use clap::{ArgGroup, Parser};
+use jeprofl::report::{csv, flame, pretty};
+use jeprofl::{run_collector_thread, MetricKind, MetricRuntime, MetricSpec, OrderBy, Retention};
+use jeprofl_common::{Config, Histogram, HistogramKey, CONFIG_SLOT, COUNTER_SLOT};
 use log::{debug, info, warn};
 use minus::{ExitStrategy, Pager};
-use std::fmt::Display;
+use std::fmt::Write as _;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
-mod collector;
-mod resolver;
-
 #[derive(Debug, Parser)]
+#[command(
+    group(
+        ArgGroup::new("target")
+            .required(true)
+            .multiple(true)
+            .args(["pid", "program"])
+    )
+)]
 struct Opt {
     #[clap(short, long)]
     pid: Option<i32>,
 
     #[clap(long)]
-    program: PathBuf,
+    program: Option<PathBuf>,
 
-    #[clap(short, long, default_value = "malloc")]
-    function: JemallocAllocFunctions,
+    #[clap(short, long)]
+    function: String,
+
+    #[clap(long("metric"), value_enum, default_values_t = [MetricKind::Count])]
+    metrics: Vec<MetricKind>,
+
+    #[clap(long, default_value_t = 0)]
+    min_time: u64,
+
+    #[clap(long, default_value_t = u64::MAX)]
+    max_time: u64,
+
+    #[clap(long, default_value_t = 0)]
+    min_count: u64,
+
+    #[clap(long, default_value_t = u64::MAX)]
+    max_count: u64,
 
     #[clap(short, long, default_value_t = OrderBy::Count)]
     order_by: OrderBy,
 
-    /// Max alloc size to track
-    #[clap(short, long, default_value_t = u64::MAX)]
-    max_alloc_size: u64,
-    /// Min allocation size to track
-    #[clap(short, long)]
-    #[clap(default_value_t = 0)]
-    min_alloc_size: u64,
-
     /// Specify the sampling interval for events.
     /// For example, '1' samples every event, '1000' samples every 1000th event.
-    #[clap(short, long)]
+    #[clap(short = 'e', long)]
     #[clap(default_value_t = NonZeroU32::new(1).unwrap())]
     sample_every: NonZeroU32,
 
-    /// skip allocations with total alocated < `skip_size` bytes
-    #[clap(short, long, default_value_t = ByteSize(1))]
-    skip_size: ByteSize,
+    /// Skip stack traces with total value below the threshold
+    #[clap(short = 's', long, default_value_t = 0)]
+    skip_value: u64,
 
-    /// Skips stack traces with total count < `skip_count`
-    #[clap(long, default_value_t = 1000)]
+    /// Skip stack traces with total count below the threshold
+    #[clap(long, default_value_t = 0)]
     skip_count: u64,
 
     #[clap(long("csv"))]
@@ -69,75 +77,27 @@ struct Opt {
     flame_graph: Option<PathBuf>,
 }
 
-#[derive(derive_more::Display, derive_more::FromStr, Debug, Copy, Clone)]
-enum OrderBy {
-    Count,
-    Traffic,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum JemallocAllocFunctions {
-    Malloc,
-    Calloc,
-    Realloc,
-    Mallocx,
-    Rallocx,
-    Xallocx,
-}
-
-impl FromStr for JemallocAllocFunctions {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "malloc" => Ok(Self::Malloc),
-            "calloc" => Ok(Self::Calloc),
-            "realloc" => Ok(Self::Realloc),
-            "mallocx" => Ok(Self::Mallocx),
-            "rallocx" => Ok(Self::Rallocx),
-            "xallocx" => Ok(Self::Xallocx),
-            _ => Err(anyhow::anyhow!("Invalid function name {}", s)),
-        }
+fn suffix_path(base: &Path, suffix: &str) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let mut candidate = base.with_file_name(format!("{stem}-{suffix}"));
+    if let Some(ext) = base.extension() {
+        candidate.set_extension(ext);
     }
-}
-
-impl Display for JemallocAllocFunctions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malloc => write!(f, "malloc"),
-            Self::Calloc => write!(f, "calloc"),
-            Self::Realloc => write!(f, "realloc"),
-            Self::Mallocx => write!(f, "mallocx"),
-            Self::Rallocx => write!(f, "rallocx"),
-            Self::Xallocx => write!(f, "xallocx"),
-        }
-    }
-}
-
-impl JemallocAllocFunctions {
-    pub fn allocation_arg_index(&self) -> u64 {
-        match self {
-            Self::Malloc => 0,
-            Self::Calloc => 1,
-            Self::Realloc => 1,
-            Self::Mallocx => 1,
-            Self::Rallocx => 1,
-            Self::Xallocx => 1,
-        }
-    }
+    candidate
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     scopeguard::defer! {
-          crossterm::execute!(std::io::stdout(),crossterm::cursor::Show).ok();
+        crossterm::execute!(std::io::stdout(),crossterm::cursor::Show).ok();
     };
     let opt = Opt::parse();
 
     env_logger::init();
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -147,10 +107,25 @@ async fn main() -> Result<(), anyhow::Error> {
         debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
+    ensure!(
+        opt.min_time <= opt.max_time,
+        "--min-time must be less than or equal to --max-time"
+    );
+    ensure!(
+        opt.min_count <= opt.max_count,
+        "--min-count must be less than or equal to --max-count"
+    );
+
+    let mut metrics = Vec::new();
+    for metric in opt.metrics.iter().copied() {
+        if !metrics.contains(&metric) {
+            metrics.push(metric);
+        }
+    }
+    if metrics.is_empty() {
+        metrics.push(MetricKind::Count);
+    }
+
     #[cfg(debug_assertions)]
     let mut bpf = Ebpf::load(include_bytes_aligned!(
         "../../target/bpfel-unknown-none/debug/jeprofl"
@@ -160,96 +135,207 @@ async fn main() -> Result<(), anyhow::Error> {
         "../../target/bpfel-unknown-none/release/jeprofl"
     ))?;
     if let Err(e) = EbpfLogger::init(&mut bpf) {
-        // This can happen if you remove all log statements from your eBPF program.
         warn!("failed to initialize eBPF logger: {}", e);
     }
 
     {
-        let config_map = bpf.map_mut("CONFIG").expect("CONFIG not found");
-        let mut config_map = PerCpuArray::try_from(config_map)?;
         let num_cpus = nr_cpus().unwrap();
-        config_map.set(
-            MIN_ALLOC_INDEX,
-            PerCpuValues::try_from(vec![opt.min_alloc_size; num_cpus])?,
-            0,
-        )?;
-        config_map.set(
-            MAX_ALLOC_INDEX,
-            PerCpuValues::try_from(vec![opt.max_alloc_size; num_cpus])?,
-            0,
-        )?;
-        config_map.set(COUNT_INDEX, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
-        config_map.set(
-            SAMPLE_EVERY_INDEX,
-            PerCpuValues::try_from(vec![opt.sample_every.get() as u64; num_cpus])?,
-            0,
-        )?;
-        config_map.set(
-            FUNCTION_INFO_INDEX,
-            PerCpuValues::try_from(vec![opt.function.allocation_arg_index(); num_cpus])?,
-            0,
-        )?;
+        if metrics.contains(&MetricKind::Count) {
+            let config_map = bpf.map_mut("CONFIG_COUNT").expect("CONFIG_COUNT not found");
+            let mut config_map = PerCpuArray::<_, Config>::try_from(config_map)?;
+            let cfg = Config {
+                mode: MetricKind::Count.to_mode() as u32,
+                min_value: opt.min_count,
+                max_value: opt.max_count,
+                sample_every: opt.sample_every.get(),
+                _pad: 0,
+            };
+            config_map.set(CONFIG_SLOT, PerCpuValues::try_from(vec![cfg; num_cpus])?, 0)?;
+            let counter_map = bpf
+                .map_mut("COUNTER_COUNT")
+                .expect("COUNTER_COUNT not found");
+            let mut counter_map = PerCpuArray::<_, u64>::try_from(counter_map)?;
+            counter_map.set(COUNTER_SLOT, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
+            log::info!(
+                "Recording {} between {} and {}",
+                MetricKind::Count.value_label(),
+                opt.min_count,
+                opt.max_count
+            );
+        }
+        if metrics.contains(&MetricKind::Duration) {
+            let config_map = bpf
+                .map_mut("CONFIG_LATENCY")
+                .expect("CONFIG_LATENCY not found");
+            let mut config_map = PerCpuArray::<_, Config>::try_from(config_map)?;
+            let cfg = Config {
+                mode: MetricKind::Duration.to_mode() as u32,
+                min_value: opt.min_time,
+                max_value: opt.max_time,
+                sample_every: opt.sample_every.get(),
+                _pad: 0,
+            };
+            config_map.set(CONFIG_SLOT, PerCpuValues::try_from(vec![cfg; num_cpus])?, 0)?;
+            let counter_map = bpf
+                .map_mut("COUNTER_LATENCY")
+                .expect("COUNTER_LATENCY not found");
+            let mut counter_map = PerCpuArray::<_, u64>::try_from(counter_map)?;
+            counter_map.set(COUNTER_SLOT, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
+            log::info!(
+                "Recording {} between {} and {}",
+                MetricKind::Duration.value_label(),
+                opt.min_time,
+                opt.max_time
+            );
+        }
     }
 
-    let program: &mut UProbe = bpf.program_mut("malloc").unwrap().try_into()?;
-    program.load()?;
+    let function = opt.function.clone();
+    let program_path = opt
+        .program
+        .clone()
+        .or_else(|| opt.pid.map(|pid| PathBuf::from(format!("/proc/{pid}/exe"))))
+        .expect("target group ensures pid or program is set");
+    if metrics.contains(&MetricKind::Count) {
+        let entry: &mut UProbe = bpf.program_mut("probe_count_entry").unwrap().try_into()?;
+        entry.load()?;
+        log::info!(
+            "Attaching count entry probe: {}:{}",
+            program_path.display(),
+            function
+        );
+        entry.attach(Some(function.as_str()), 0, &program_path, opt.pid)?;
+    }
+    if metrics.contains(&MetricKind::Duration) {
+        let entry: &mut UProbe = bpf.program_mut("probe_latency_entry").unwrap().try_into()?;
+        entry.load()?;
+        log::info!(
+            "Attaching latency entry probe: {}:{}",
+            program_path.display(),
+            function
+        );
+        entry.attach(Some(function.as_str()), 0, &program_path, opt.pid)?;
 
-    let function = opt.function.to_string();
-    log::info!(
-        "Attaching to function: {}:{}",
-        opt.program.display(),
-        function
-    );
-
-    program.attach(Some(function.as_str()), 0, &opt.program, opt.pid)?;
+        let ret_probe: &mut UProbe = bpf.program_mut("probe_latency_ret").unwrap().try_into()?;
+        ret_probe.load()?;
+        log::info!(
+            "Attaching latency return probe: {}:{}",
+            program_path.display(),
+            opt.function
+        );
+        ret_probe.attach(Some(opt.function.as_str()), 0, &program_path, opt.pid)?;
+    }
 
     let stack_traces = StackTraceMap::try_from(bpf.take_map("STACKTRACES").unwrap())?;
 
     let start = std::time::Instant::now();
-    let per_cpu_map: PerCpuHashMap<_, HistogramKey, Histogram> =
-        PerCpuHashMap::try_from(bpf.take_map("HISTOGRAMS").unwrap())?;
+    let mut metric_runtimes = Vec::new();
+    if metrics.contains(&MetricKind::Count) {
+        let spec = MetricSpec::new(MetricKind::Count, opt.skip_value, opt.skip_count);
+        let map: PerCpuHashMap<_, HistogramKey, Histogram> =
+            PerCpuHashMap::try_from(bpf.take_map("HISTOGRAMS_COUNT").unwrap())?;
+        metric_runtimes.push(MetricRuntime::new(spec, map));
+        log::info!(
+            "{} metric: skip stack traces with total {} < {} or sample count < {}",
+            spec.kind,
+            spec.value_label,
+            spec.skip_total_value_lt,
+            spec.skip_total_count_lt
+        );
+    }
+    if metrics.contains(&MetricKind::Duration) {
+        let spec = MetricSpec::new(MetricKind::Duration, opt.skip_value, opt.skip_count);
+        let map: PerCpuHashMap<_, HistogramKey, Histogram> =
+            PerCpuHashMap::try_from(bpf.take_map("HISTOGRAMS_LATENCY").unwrap())?;
+        metric_runtimes.push(MetricRuntime::new(spec, map));
+        log::info!(
+            "{} metric: skip stack traces with total {} < {} or sample count < {}",
+            spec.kind,
+            spec.value_label,
+            spec.skip_total_value_lt,
+            spec.skip_total_count_lt
+        );
+    }
     log::info!(
-        "Opened per_cpu_map, took {:?}",
+        "Opened histogram maps, took {:?}",
         start.elapsed().as_secs_f64()
-    );
-    log::info!(
-        "Will not save stack traces which has total alocation size < {} or count < {}",
-        opt.skip_count,
-        opt.skip_size
     );
 
     let canceled = Arc::new(AtomicBool::new(false));
-    let handle = spawn_collector(
-        per_cpu_map,
+    let handle = run_collector_thread(
+        metric_runtimes,
         canceled.clone(),
         stack_traces,
-        opt.skip_size.0,
-        opt.skip_count,
+        Retention::default(),
     );
 
     info!("Waiting for Ctrl-C...");
     signal::ctrl_c().await?;
     info!("Exiting...");
     canceled.store(true, std::sync::atomic::Ordering::Release);
-    // to reduce the probability of installing 2 signal handlers
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Initialize the pager
     let mut pager = Pager::new();
     pager.set_exit_strategy(ExitStrategy::PagerQuit)?;
-    // Run the pager in a separate thread
-    let t = {
+    let pager_thread = {
         let pager = pager.clone();
         std::thread::spawn(move || minus::dynamic_paging(pager))
     };
 
-    let handle = handle.join().expect("failed to join thread");
+    let results = handle.join()?;
+    let multi_metric = results.len() > 1;
 
-    // let mut str = String::new();
-    handle.print_histogram(opt.order_by, &mut pager, opt.csv_path, opt.flame_graph)?;
+    for (kind, aggregator) in results {
+        if multi_metric {
+            writeln!(&mut pager, "{} metric\n", kind)?;
+        }
 
-    t.join().unwrap()?;
+        let merged = aggregator.merged();
+        pretty::render(&mut pager, &merged, opt.order_by, &aggregator)?;
 
+        if let Some(base) = &opt.csv_path {
+            let path = if multi_metric {
+                suffix_path(base, kind.file_suffix())
+            } else {
+                base.clone()
+            };
+            csv::write(path.as_path(), &merged, &aggregator)?;
+        }
+
+        if let Some(base) = &opt.flame_graph {
+            let target = if multi_metric {
+                suffix_path(base, kind.file_suffix())
+            } else {
+                base.clone()
+            };
+
+            let path_without_extension = match target.file_stem() {
+                Some(stem) => target.with_file_name(stem),
+                None => target.clone(),
+            };
+
+            let result = path_without_extension.to_string_lossy();
+            let outputs = [
+                (
+                    PathBuf::from(format!("{result}-by-count.svg")),
+                    OrderBy::Count,
+                ),
+                (
+                    PathBuf::from(format!("{result}-by-traffic.svg")),
+                    OrderBy::Traffic,
+                ),
+            ];
+
+            for (output_path, mode) in outputs {
+                let file = std::fs::File::create(&output_path)?;
+                let writer = std::io::BufWriter::new(file);
+                flame::write(writer, &merged, &aggregator, mode)?;
+                log::info!("Flamegraph written to {:?}", output_path);
+            }
+        }
+    }
+
+    pager_thread.join().unwrap()?;
     log::info!("Exited");
     Ok(())
 }
