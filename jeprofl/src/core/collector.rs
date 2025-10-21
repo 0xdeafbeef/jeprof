@@ -70,8 +70,9 @@ pub fn run_collector_thread(
                     let mut skipped_on_all_cpus = true;
 
                     for (cpu, hist) in per_cpu_histograms.iter().enumerate() {
-                        if hist.total < spec.skip_total_value_lt
-                            && hist.total_count() < spec.skip_total_count_lt
+                        if (hist.total == 0 && hist.total_count() == 0)
+                            || hist.total < spec.skip_total_value_lt
+                            || hist.total_count() < spec.skip_total_count_lt
                         {
                             continue;
                         }

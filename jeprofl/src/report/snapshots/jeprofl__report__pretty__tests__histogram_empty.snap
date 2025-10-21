@@ -1,7 +1,8 @@
 ---
 source: jeprofl/src/report/pretty.rs
+assertion_line: 269
 expression: buf
 ---
-≤UpperBound | Count     | Percentage | ##################################################
-----------+-----------+------------+--------------------------------------------------
-Total value: 0 across 0 events
+≤UpperBound |     Count | Percentage | ##################################################
+----------+-----------+-----------+--------------------------------------------------
+Total count: 0 across 0 events

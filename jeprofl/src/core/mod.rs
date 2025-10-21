@@ -2,6 +2,7 @@ pub mod collector;
 pub mod merge;
 pub mod model;
 pub mod resolver;
+pub mod symbols;
 
 pub use collector::{run_collector_thread, CollectorHandle, StatsAggregator};
 pub use model::{MetricKind, MetricRuntime, MetricSpec, OrderBy, Retention};

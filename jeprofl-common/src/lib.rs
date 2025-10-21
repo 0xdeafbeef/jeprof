@@ -3,7 +3,7 @@
 pub const CONFIG_SLOT: u32 = 0;
 pub const COUNTER_SLOT: u32 = 0;
 
-pub const HISTOGRAM_BUCKETS: usize = 56;
+pub const HISTOGRAM_BUCKETS: usize = 40;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,25 +29,19 @@ unsafe impl aya::Pod for Config {}
 #[derive(Clone, Debug, Copy, Hash, PartialEq, Eq)]
 pub struct HistogramKey {
     pid_stack: u64,
-    cpu: u64, // for alignment
 }
 
 impl HistogramKey {
-    pub fn new(pid: u32, stack_id: u32, cpu: u32) -> Self {
+    pub fn new(pid: u32, stack_id: u32) -> Self {
         Self {
-            pid_stack: ((pid as u64) << 32 | stack_id as u64),
-            cpu: cpu as u64,
+            pid_stack: ((pid as u64) << 32) | (stack_id as u64),
         }
     }
 
     pub fn into_parts(&self) -> UnpackedHistogramKey {
         let pid = (self.pid_stack >> 32) as u32;
         let stack_id = self.pid_stack as u32;
-        UnpackedHistogramKey {
-            pid,
-            stack_id,
-            cpu: self.cpu as u32,
-        }
+        UnpackedHistogramKey { pid, stack_id }
     }
 }
 
@@ -55,7 +49,6 @@ impl HistogramKey {
 pub struct UnpackedHistogramKey {
     pub pid: u32,
     pub stack_id: u32,
-    pub cpu: u32,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

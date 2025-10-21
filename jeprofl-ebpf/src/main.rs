@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
+#![expect(
+    static_mut_refs,
+    reason = "Aya eBPF maps require referencing `static mut` handles"
+)]
 
 use aya_ebpf::bindings::BPF_F_USER_STACK;
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_ktime_get_ns};
+use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns};
 use aya_ebpf::macros::{map, uprobe, uretprobe};
-use aya_ebpf::maps::{HashMap, PerCpuArray, PerCpuHashMap, StackTrace};
+use aya_ebpf::maps::{LruHashMap, PerCpuArray, PerCpuHashMap, StackTrace};
 use aya_ebpf::programs::{ProbeContext, RetProbeContext};
 use jeprofl_common::{Config, Histogram, HistogramKey, MetricMode, CONFIG_SLOT, COUNTER_SLOT};
 
@@ -20,9 +24,8 @@ static COUNTER_COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map(name = "COUNTER_LATENCY")]
 static COUNTER_LATENCY: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
-// NOTE: ensure this size is feasible for your RLIMIT_MEMLOCK limits
 #[map(name = "STACKTRACES")]
-static mut STACKTRACES: StackTrace = StackTrace::with_max_entries(1024 * 1024, 0);
+static mut STACKTRACES: StackTrace = StackTrace::with_max_entries(10_000, 0);
 
 #[map(name = "HISTOGRAMS_COUNT")]
 static mut HISTOGRAMS_COUNT: PerCpuHashMap<HistogramKey, Histogram> =
@@ -44,7 +47,7 @@ struct LatencyStack {
 }
 
 #[map(name = "INFLIGHT_LATENCY")]
-static mut INFLIGHT_LATENCY: HashMap<u64, LatencyStack> = HashMap::with_max_entries(10240, 0);
+static mut INFLIGHT_LATENCY: LruHashMap<u64, LatencyStack> = LruHashMap::with_max_entries(10240, 0);
 
 #[uprobe]
 pub fn probe_count_entry(ctx: ProbeContext) -> u32 {
@@ -71,8 +74,7 @@ fn try_probe_count_entry(ctx: ProbeContext) -> Result<u32, u32> {
 
         let pid_tgid = bpf_get_current_pid_tgid();
         let tgid = (pid_tgid >> 32) as u32; // process id
-        let cpu = bpf_get_smp_processor_id();
-        update_count_hist(1, tgid, stack_id, cpu);
+        update_count_hist(1, tgid, stack_id);
     }
     Ok(0)
 }
@@ -182,8 +184,7 @@ fn try_probe_latency_ret(_ctx: RetProbeContext) -> Result<u32, u32> {
             return Ok(0);
         }
         let stack_id = stored_stack_id as u32;
-        let cpu = bpf_get_smp_processor_id();
-        update_latency_hist(value, tgid, stack_id, cpu);
+        update_latency_hist(value, tgid, stack_id);
     }
     Ok(0)
 }
@@ -219,9 +220,8 @@ fn should_sample_latency(sample_every: u32) -> bool {
 }
 
 #[inline(always)]
-unsafe fn update_count_hist(value: u64, tgid: u32, stack_id: u32, current_cpu: u32) {
-    // Keeping CPU in key to match userspace expectations
-    let key = HistogramKey::new(tgid, stack_id, current_cpu as _);
+unsafe fn update_count_hist(value: u64, tgid: u32, stack_id: u32) {
+    let key = HistogramKey::new(tgid, stack_id);
     match HISTOGRAMS_COUNT.get_ptr_mut(&key) {
         None => {
             let mut histogram = Histogram::new();
@@ -237,9 +237,8 @@ unsafe fn update_count_hist(value: u64, tgid: u32, stack_id: u32, current_cpu: u
 }
 
 #[inline(always)]
-unsafe fn update_latency_hist(value: u64, tgid: u32, stack_id: u32, current_cpu: u32) {
-    // Keeping CPU in key to match userspace expectations
-    let key = HistogramKey::new(tgid, stack_id, current_cpu as _);
+unsafe fn update_latency_hist(value: u64, tgid: u32, stack_id: u32) {
+    let key = HistogramKey::new(tgid, stack_id);
     match HISTOGRAMS_LATENCY.get_ptr_mut(&key) {
         None => {
             let mut histogram = Histogram::new();

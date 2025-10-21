@@ -1,12 +1,15 @@
-use anyhow::ensure;
-use aya::maps::{PerCpuArray, PerCpuHashMap, PerCpuValues, StackTraceMap};
+use anyhow::{bail, ensure};
+use aya::maps::{MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, StackTraceMap};
 use aya::programs::UProbe;
 use aya::util::nr_cpus;
 use aya::{include_bytes_aligned, Ebpf};
 use aya_log::EbpfLogger;
 use clap::{ArgGroup, Parser};
 use jeprofl::report::{csv, flame, pretty};
-use jeprofl::{run_collector_thread, MetricKind, MetricRuntime, MetricSpec, OrderBy, Retention};
+use jeprofl::{
+    filter_symbols, list_text_symbols, run_collector_thread, MatchMode, MetricKind, MetricRuntime,
+    MetricSpec, OrderBy, Retention, SymEntry,
+};
 use jeprofl_common::{Config, Histogram, HistogramKey, CONFIG_SLOT, COUNTER_SLOT};
 use log::{debug, info, warn};
 use minus::{ExitStrategy, Pager};
@@ -34,8 +37,20 @@ struct Opt {
     #[clap(long)]
     program: Option<PathBuf>,
 
-    #[clap(short, long)]
-    function: String,
+    #[clap(
+        short = 'f',
+        long = "function",
+        required = true,
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    functions: Vec<String>,
+
+    #[clap(long = "match", value_enum, default_value_t = MatchCli::Contains)]
+    match_mode: MatchCli,
+
+    #[clap(long = "list-only")]
+    list_only: bool,
 
     #[clap(long("metric"), value_enum, default_values_t = [MetricKind::Count])]
     metrics: Vec<MetricKind>,
@@ -77,6 +92,297 @@ struct Opt {
     flame_graph: Option<PathBuf>,
 }
 
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum MatchCli {
+    Contains,
+    Exact,
+    Regex,
+}
+
+impl From<MatchCli> for MatchMode {
+    fn from(value: MatchCli) -> Self {
+        match value {
+            MatchCli::Contains => MatchMode::Contains,
+            MatchCli::Exact => MatchMode::Exact,
+            MatchCli::Regex => MatchMode::Regex,
+        }
+    }
+}
+
+struct MetricDesc {
+    config_map: &'static str,
+    counter_map: &'static str,
+    histogram_map: &'static str,
+    entry_prog: &'static str,
+    ret_prog: Option<&'static str>,
+    min: u64,
+    max: u64,
+}
+
+struct MatchResolution {
+    program_path: PathBuf,
+    matches: Vec<SymEntry>,
+}
+
+fn metric_desc(kind: MetricKind, opt: &Opt) -> MetricDesc {
+    match kind {
+        MetricKind::Count => MetricDesc {
+            config_map: "CONFIG_COUNT",
+            counter_map: "COUNTER_COUNT",
+            histogram_map: "HISTOGRAMS_COUNT",
+            entry_prog: "probe_count_entry",
+            ret_prog: None,
+            min: opt.min_count,
+            max: opt.max_count,
+        },
+        MetricKind::Duration => MetricDesc {
+            config_map: "CONFIG_LATENCY",
+            counter_map: "COUNTER_LATENCY",
+            histogram_map: "HISTOGRAMS_LATENCY",
+            entry_prog: "probe_latency_entry",
+            ret_prog: Some("probe_latency_ret"),
+            min: opt.min_time,
+            max: opt.max_time,
+        },
+    }
+}
+
+fn select_metrics(opt: &Opt) -> Vec<MetricKind> {
+    let mut metrics = Vec::new();
+    for metric in opt.metrics.iter().copied() {
+        if !metrics.contains(&metric) {
+            metrics.push(metric);
+        }
+    }
+    if metrics.is_empty() {
+        metrics.push(MetricKind::Count);
+    }
+    metrics
+}
+
+fn load_bpf() -> Result<Ebpf, anyhow::Error> {
+    #[cfg(debug_assertions)]
+    let bytes = include_bytes_aligned!("../../target/bpfel-unknown-none/debug/jeprofl");
+    #[cfg(not(debug_assertions))]
+    let bytes = include_bytes_aligned!("../../target/bpfel-unknown-none/release/jeprofl");
+    Ok(Ebpf::load(bytes)?)
+}
+
+fn configure_metric_maps(
+    bpf: &mut Ebpf,
+    metrics: &[MetricKind],
+    opt: &Opt,
+) -> Result<(), anyhow::Error> {
+    let num_cpus = nr_cpus().unwrap();
+
+    for &kind in metrics {
+        let desc = metric_desc(kind, opt);
+
+        let config_map = bpf
+            .map_mut(desc.config_map)
+            .unwrap_or_else(|| panic!("{map} not found", map = desc.config_map));
+        let mut config_map = PerCpuArray::<_, Config>::try_from(config_map)?;
+        let cfg = Config {
+            mode: kind.to_mode() as u32,
+            min_value: desc.min,
+            max_value: desc.max,
+            sample_every: opt.sample_every.get(),
+            _pad: 0,
+        };
+        config_map.set(CONFIG_SLOT, PerCpuValues::try_from(vec![cfg; num_cpus])?, 0)?;
+
+        let counter_map = bpf
+            .map_mut(desc.counter_map)
+            .unwrap_or_else(|| panic!("{map} not found", map = desc.counter_map));
+        let mut counter_map = PerCpuArray::<_, u64>::try_from(counter_map)?;
+        counter_map.set(COUNTER_SLOT, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
+
+        info!(
+            "Recording {} between {} and {}",
+            kind.value_label(),
+            desc.min,
+            desc.max
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_matches(opt: &Opt) -> Result<MatchResolution, anyhow::Error> {
+    let program_path = opt
+        .program
+        .clone()
+        .or_else(|| opt.pid.map(|pid| PathBuf::from(format!("/proc/{pid}/exe"))))
+        .expect("target group ensures pid or program is set");
+
+    let patterns: Vec<String> = opt
+        .functions
+        .iter()
+        .map(|pattern| pattern.trim().to_string())
+        .filter(|pattern| !pattern.is_empty())
+        .collect();
+    if patterns.is_empty() {
+        bail!("no function patterns supplied");
+    }
+
+    let symbols = list_text_symbols(program_path.as_path())?;
+    let match_mode: MatchMode = opt.match_mode.into();
+    let matches = filter_symbols(&symbols, &patterns, match_mode)?;
+    let missing = unmatched_patterns(&symbols, &patterns, match_mode)?;
+    if !missing.is_empty() {
+        warn!("no functions matched for patterns: {:?}", missing);
+    }
+    if matches.is_empty() {
+        bail!(
+            "no functions matched in {} for patterns {:?}",
+            program_path.display(),
+            patterns
+        );
+    }
+
+    info!("Matched {} function(s):", matches.len());
+    for sym in &matches {
+        info!(
+            "  {} (mangled: {}) @ 0x{:x}",
+            sym.demangled, sym.mangled, sym.addr
+        );
+    }
+
+    let owned = matches.into_iter().cloned().collect();
+    Ok(MatchResolution {
+        program_path,
+        matches: owned,
+    })
+}
+
+fn unmatched_patterns<'a>(
+    symbols: &'a [SymEntry],
+    patterns: &'a [String],
+    mode: MatchMode,
+) -> Result<Vec<&'a str>, anyhow::Error> {
+    use MatchMode::*;
+    let missing = match mode {
+        Contains => patterns
+            .iter()
+            .filter_map(|pattern| {
+                if symbols
+                    .iter()
+                    .any(|symbol| symbol.demangled.contains(pattern))
+                {
+                    None
+                } else {
+                    Some(pattern.as_str())
+                }
+            })
+            .collect(),
+        Exact => patterns
+            .iter()
+            .filter_map(|pattern| {
+                if symbols.iter().any(|symbol| symbol.demangled == *pattern) {
+                    None
+                } else {
+                    Some(pattern.as_str())
+                }
+            })
+            .collect(),
+        Regex => {
+            let compiled = patterns
+                .iter()
+                .map(|pattern| regex::Regex::new(pattern))
+                .collect::<Result<Vec<_>, _>>()?;
+            patterns
+                .iter()
+                .zip(compiled.iter())
+                .filter_map(|(pattern, matcher)| {
+                    if symbols
+                        .iter()
+                        .any(|symbol| matcher.is_match(&symbol.demangled))
+                    {
+                        None
+                    } else {
+                        Some(pattern.as_str())
+                    }
+                })
+                .collect()
+        }
+    };
+    Ok(missing)
+}
+
+fn attach_metric_probes(
+    bpf: &mut Ebpf,
+    metrics: &[MetricKind],
+    matches: &[SymEntry],
+    program_path: &Path,
+    opt: &Opt,
+) -> Result<(), anyhow::Error> {
+    for &kind in metrics {
+        let desc = metric_desc(kind, opt);
+
+        let entry: &mut UProbe = bpf.program_mut(desc.entry_prog).unwrap().try_into()?;
+        entry.load()?;
+        for sym in matches {
+            info!(
+                "Attaching {} entry probe: {}:{} ({})",
+                kind.value_label(),
+                program_path.display(),
+                sym.demangled,
+                sym.mangled
+            );
+            entry.attach(Some(sym.mangled.as_str()), 0, program_path, opt.pid)?;
+        }
+
+        if let Some(ret_prog) = desc.ret_prog {
+            let ret_probe: &mut UProbe = bpf.program_mut(ret_prog).unwrap().try_into()?;
+            ret_probe.load()?;
+            for sym in matches {
+                info!(
+                    "Attaching {} return probe: {}:{} ({})",
+                    kind.value_label(),
+                    program_path.display(),
+                    sym.demangled,
+                    sym.mangled
+                );
+                ret_probe.attach(Some(sym.mangled.as_str()), 0, program_path, opt.pid)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn open_runtime_maps(
+    bpf: &mut Ebpf,
+    metrics: &[MetricKind],
+    opt: &Opt,
+) -> Result<(StackTraceMap<MapData>, Vec<MetricRuntime>), anyhow::Error> {
+    let stack_traces = StackTraceMap::try_from(bpf.take_map("STACKTRACES").unwrap())?;
+
+    let start = std::time::Instant::now();
+    let mut metric_runtimes = Vec::new();
+
+    for &kind in metrics {
+        let desc = metric_desc(kind, opt);
+        let spec = MetricSpec::new(kind, opt.skip_value, opt.skip_count);
+        let map: PerCpuHashMap<_, HistogramKey, Histogram> = PerCpuHashMap::try_from(
+            bpf.take_map(desc.histogram_map)
+                .unwrap_or_else(|| panic!("{map} not found", map = desc.histogram_map)),
+        )?;
+        metric_runtimes.push(MetricRuntime::new(spec, map));
+        info!(
+            "{} metric: skip stack traces with total {} < {} or sample count < {}",
+            spec.kind, spec.value_label, spec.skip_total_value_lt, spec.skip_total_count_lt
+        );
+    }
+
+    info!(
+        "Opened histogram maps, took {:?}",
+        start.elapsed().as_secs_f64()
+    );
+
+    Ok((stack_traces, metric_runtimes))
+}
+
 fn suffix_path(base: &Path, suffix: &str) -> PathBuf {
     let stem = base
         .file_stem()
@@ -116,150 +422,29 @@ async fn main() -> Result<(), anyhow::Error> {
         "--min-count must be less than or equal to --max-count"
     );
 
-    let mut metrics = Vec::new();
-    for metric in opt.metrics.iter().copied() {
-        if !metrics.contains(&metric) {
-            metrics.push(metric);
-        }
-    }
-    if metrics.is_empty() {
-        metrics.push(MetricKind::Count);
-    }
+    let metrics = select_metrics(&opt);
 
-    #[cfg(debug_assertions)]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/debug/jeprofl"
-    ))?;
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/jeprofl"
-    ))?;
+    let mut bpf = load_bpf()?;
     if let Err(e) = EbpfLogger::init(&mut bpf) {
         warn!("failed to initialize eBPF logger: {}", e);
     }
 
-    {
-        let num_cpus = nr_cpus().unwrap();
-        if metrics.contains(&MetricKind::Count) {
-            let config_map = bpf.map_mut("CONFIG_COUNT").expect("CONFIG_COUNT not found");
-            let mut config_map = PerCpuArray::<_, Config>::try_from(config_map)?;
-            let cfg = Config {
-                mode: MetricKind::Count.to_mode() as u32,
-                min_value: opt.min_count,
-                max_value: opt.max_count,
-                sample_every: opt.sample_every.get(),
-                _pad: 0,
-            };
-            config_map.set(CONFIG_SLOT, PerCpuValues::try_from(vec![cfg; num_cpus])?, 0)?;
-            let counter_map = bpf
-                .map_mut("COUNTER_COUNT")
-                .expect("COUNTER_COUNT not found");
-            let mut counter_map = PerCpuArray::<_, u64>::try_from(counter_map)?;
-            counter_map.set(COUNTER_SLOT, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
-            log::info!(
-                "Recording {} between {} and {}",
-                MetricKind::Count.value_label(),
-                opt.min_count,
-                opt.max_count
-            );
-        }
-        if metrics.contains(&MetricKind::Duration) {
-            let config_map = bpf
-                .map_mut("CONFIG_LATENCY")
-                .expect("CONFIG_LATENCY not found");
-            let mut config_map = PerCpuArray::<_, Config>::try_from(config_map)?;
-            let cfg = Config {
-                mode: MetricKind::Duration.to_mode() as u32,
-                min_value: opt.min_time,
-                max_value: opt.max_time,
-                sample_every: opt.sample_every.get(),
-                _pad: 0,
-            };
-            config_map.set(CONFIG_SLOT, PerCpuValues::try_from(vec![cfg; num_cpus])?, 0)?;
-            let counter_map = bpf
-                .map_mut("COUNTER_LATENCY")
-                .expect("COUNTER_LATENCY not found");
-            let mut counter_map = PerCpuArray::<_, u64>::try_from(counter_map)?;
-            counter_map.set(COUNTER_SLOT, PerCpuValues::try_from(vec![0; num_cpus])?, 0)?;
-            log::info!(
-                "Recording {} between {} and {}",
-                MetricKind::Duration.value_label(),
-                opt.min_time,
-                opt.max_time
-            );
-        }
+    configure_metric_maps(&mut bpf, &metrics, &opt)?;
+
+    let resolution = resolve_matches(&opt)?;
+    if opt.list_only {
+        return Ok(());
     }
 
-    let function = opt.function.clone();
-    let program_path = opt
-        .program
-        .clone()
-        .or_else(|| opt.pid.map(|pid| PathBuf::from(format!("/proc/{pid}/exe"))))
-        .expect("target group ensures pid or program is set");
-    if metrics.contains(&MetricKind::Count) {
-        let entry: &mut UProbe = bpf.program_mut("probe_count_entry").unwrap().try_into()?;
-        entry.load()?;
-        log::info!(
-            "Attaching count entry probe: {}:{}",
-            program_path.display(),
-            function
-        );
-        entry.attach(Some(function.as_str()), 0, &program_path, opt.pid)?;
-    }
-    if metrics.contains(&MetricKind::Duration) {
-        let entry: &mut UProbe = bpf.program_mut("probe_latency_entry").unwrap().try_into()?;
-        entry.load()?;
-        log::info!(
-            "Attaching latency entry probe: {}:{}",
-            program_path.display(),
-            function
-        );
-        entry.attach(Some(function.as_str()), 0, &program_path, opt.pid)?;
+    attach_metric_probes(
+        &mut bpf,
+        &metrics,
+        &resolution.matches,
+        resolution.program_path.as_path(),
+        &opt,
+    )?;
 
-        let ret_probe: &mut UProbe = bpf.program_mut("probe_latency_ret").unwrap().try_into()?;
-        ret_probe.load()?;
-        log::info!(
-            "Attaching latency return probe: {}:{}",
-            program_path.display(),
-            opt.function
-        );
-        ret_probe.attach(Some(opt.function.as_str()), 0, &program_path, opt.pid)?;
-    }
-
-    let stack_traces = StackTraceMap::try_from(bpf.take_map("STACKTRACES").unwrap())?;
-
-    let start = std::time::Instant::now();
-    let mut metric_runtimes = Vec::new();
-    if metrics.contains(&MetricKind::Count) {
-        let spec = MetricSpec::new(MetricKind::Count, opt.skip_value, opt.skip_count);
-        let map: PerCpuHashMap<_, HistogramKey, Histogram> =
-            PerCpuHashMap::try_from(bpf.take_map("HISTOGRAMS_COUNT").unwrap())?;
-        metric_runtimes.push(MetricRuntime::new(spec, map));
-        log::info!(
-            "{} metric: skip stack traces with total {} < {} or sample count < {}",
-            spec.kind,
-            spec.value_label,
-            spec.skip_total_value_lt,
-            spec.skip_total_count_lt
-        );
-    }
-    if metrics.contains(&MetricKind::Duration) {
-        let spec = MetricSpec::new(MetricKind::Duration, opt.skip_value, opt.skip_count);
-        let map: PerCpuHashMap<_, HistogramKey, Histogram> =
-            PerCpuHashMap::try_from(bpf.take_map("HISTOGRAMS_LATENCY").unwrap())?;
-        metric_runtimes.push(MetricRuntime::new(spec, map));
-        log::info!(
-            "{} metric: skip stack traces with total {} < {} or sample count < {}",
-            spec.kind,
-            spec.value_label,
-            spec.skip_total_value_lt,
-            spec.skip_total_count_lt
-        );
-    }
-    log::info!(
-        "Opened histogram maps, took {:?}",
-        start.elapsed().as_secs_f64()
-    );
+    let (stack_traces, metric_runtimes) = open_runtime_maps(&mut bpf, &metrics, &opt)?;
 
     let canceled = Arc::new(AtomicBool::new(false));
     let handle = run_collector_thread(

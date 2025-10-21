@@ -43,7 +43,7 @@ pub fn write(
             .unwrap_or_else(|| "No resolved stacktrace".to_string());
 
         let mut histogram_text = String::new();
-        write_histogram(hist, &mut histogram_text, aggregator.value_label())?;
+        write_histogram(hist, &mut histogram_text, aggregator.spec())?;
 
         writer.serialize((
             key.pid,
